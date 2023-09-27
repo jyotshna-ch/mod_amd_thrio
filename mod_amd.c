@@ -1,6 +1,9 @@
 #include <switch.h>
 
 #define AMD_PARAMS (2)
+#define AMD_PARAMS_APP_MAX 30u
+#define AMD_PARAMS_APP_START_MIN 0u
+#define AMD_PARAMS_APP_START_MAX 20u
 #define AMD_SYNTAX "<uuid> <command>"
 
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_amd_shutdown);
@@ -8,7 +11,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_amd_load);
 SWITCH_MODULE_DEFINITION(mod_amd, mod_amd_load, mod_amd_shutdown, NULL);
 SWITCH_STANDARD_APP(amd_start_function);
 
-static struct {
+struct amd_settings {
 	uint32_t initial_silence;
 	uint32_t greeting;
 	uint32_t after_greeting_silence;
@@ -18,6 +21,10 @@ static struct {
 	uint32_t maximum_number_of_words;
 	uint32_t silence_threshold;
 	uint32_t maximum_word_length;
+};
+
+static struct {
+	struct amd_settings settings;
 } globals;
 
 static switch_xml_config_item_t instructions[] = {
@@ -25,7 +32,7 @@ static switch_xml_config_item_t instructions[] = {
 		"initial_silence",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.initial_silence,
+		&globals.settings.initial_silence,
 		(void *) 2500,
 		NULL, NULL, NULL),
 
@@ -33,7 +40,7 @@ static switch_xml_config_item_t instructions[] = {
 		"greeting",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.greeting,
+		&globals.settings.greeting,
 		(void *) 1500,
 		NULL, NULL, NULL),
 
@@ -41,7 +48,7 @@ static switch_xml_config_item_t instructions[] = {
 		"after_greeting_silence",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.after_greeting_silence,
+		&globals.settings.after_greeting_silence,
 		(void *) 800,
 		NULL, NULL, NULL),
 
@@ -49,7 +56,7 @@ static switch_xml_config_item_t instructions[] = {
 		"total_analysis_time",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.total_analysis_time,
+		&globals.settings.total_analysis_time,
 		(void *) 5000,
 		NULL, NULL, NULL),
 
@@ -57,7 +64,7 @@ static switch_xml_config_item_t instructions[] = {
 		"min_word_length",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.minimum_word_length,
+		&globals.settings.minimum_word_length,
 		(void *) 100,
 		NULL, NULL, NULL),
 
@@ -65,7 +72,7 @@ static switch_xml_config_item_t instructions[] = {
 		"between_words_silence",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.between_words_silence,
+		&globals.settings.between_words_silence,
 		(void *) 50,
 		NULL, NULL, NULL),
 
@@ -73,7 +80,7 @@ static switch_xml_config_item_t instructions[] = {
 		"maximum_number_of_words",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.maximum_number_of_words,
+		&globals.settings.maximum_number_of_words,
 		(void *) 3,
 		NULL, NULL, NULL),
 
@@ -81,7 +88,7 @@ static switch_xml_config_item_t instructions[] = {
 		"maximum_word_length",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.maximum_word_length,
+		&globals.settings.maximum_word_length,
 		(void *)5000,
 		NULL, NULL, NULL),
 
@@ -89,7 +96,7 @@ static switch_xml_config_item_t instructions[] = {
 		"silence_threshold",
 		SWITCH_CONFIG_INT,
 		CONFIG_RELOADABLE,
-		&globals.silence_threshold,
+		&globals.settings.silence_threshold,
 		(void *) 256,
 		NULL, NULL, NULL),
 
@@ -144,10 +151,16 @@ typedef enum {
 	VAD_STATE_IN_SILENCE,
 } amd_vad_state_t;
 
+typedef enum {
+	AMD_APP_START_APP = 0,
+	AMD_APP_STOP_APP = 1
+} amd_app;
+
 typedef struct {
-	const switch_core_session_t *session;
+	switch_core_session_t *session;
 	switch_channel_t *channel;
 	amd_vad_state_t state;
+	struct amd_settings settings;
 	uint32_t frame_ms;
 
 	uint32_t silence_duration;
@@ -174,7 +187,7 @@ static amd_frame_classifier classify_frame(const switch_frame_t *f, const switch
 
 	score = (uint32_t) (energy / (f->samples / divisor));
 
-	if (score >= globals.silence_threshold) {
+	if (score >= globals.settings.silence_threshold) {
 		return VOICED;
 	}
 
@@ -185,7 +198,7 @@ static switch_bool_t amd_handle_silence_frame(amd_vad_t *vad, const switch_frame
 {
 	vad->silence_duration += vad->frame_ms;
 
-	if (vad->silence_duration >= globals.between_words_silence) {
+	if (vad->silence_duration >= vad->settings.between_words_silence) {
 		if (vad->state != VAD_STATE_IN_SILENCE) {
 			switch_log_printf(
 				SWITCH_CHANNEL_SESSION_LOG(vad->session),
@@ -197,26 +210,26 @@ static switch_bool_t amd_handle_silence_frame(amd_vad_t *vad, const switch_frame
 		vad->voice_duration = 0;
 	}
 
-	if (vad->in_initial_silence && vad->silence_duration >= globals.initial_silence) {
+	if (vad->in_initial_silence && vad->silence_duration >= vad->settings.initial_silence) {
 		switch_log_printf(
 			SWITCH_CHANNEL_SESSION_LOG(vad->session),
 			SWITCH_LOG_DEBUG,
 			"AMD: MACHINE (silence_duration: %d, initial_silence: %d)\n",
 			vad->silence_duration,
-			globals.initial_silence);
+			vad->settings.initial_silence);
 
 		switch_channel_set_variable(vad->channel, "amd_result", "MACHINE");
 		switch_channel_set_variable(vad->channel, "amd_cause", "INITIALSILENCE");
 		return SWITCH_TRUE;
 	}
 
-	if (vad->silence_duration >= globals.after_greeting_silence && vad->in_greeting) {
+	if (vad->silence_duration >= vad->settings.after_greeting_silence && vad->in_greeting) {
 		switch_log_printf(
 			SWITCH_CHANNEL_SESSION_LOG(vad->session),
 			SWITCH_LOG_DEBUG,
 			"AMD: HUMAN (silence_duration: %d, after_greeting_silence: %d)\n",
 			vad->silence_duration,
-			globals.after_greeting_silence);
+			vad->settings.after_greeting_silence);
 
 		switch_channel_set_variable(vad->channel, "amd_result", "HUMAN");
 		switch_channel_set_variable(vad->channel, "amd_cause", "HUMAN");
@@ -230,7 +243,7 @@ static switch_bool_t amd_handle_voiced_frame(amd_vad_t *vad, const switch_frame_
 {
 	vad->voice_duration += vad->frame_ms;
 
-	if (vad->voice_duration >= globals.minimum_word_length && vad->state == VAD_STATE_IN_SILENCE) {
+	if (vad->voice_duration >= vad->settings.minimum_word_length && vad->state == VAD_STATE_IN_SILENCE) {
 		vad->words++;
 
 		switch_log_printf(
@@ -242,46 +255,46 @@ static switch_bool_t amd_handle_voiced_frame(amd_vad_t *vad, const switch_frame_
 		vad->state = VAD_STATE_IN_WORD;
 	}
 
-	if (vad->voice_duration >= globals.maximum_word_length) {
+	if (vad->voice_duration >= vad->settings.maximum_word_length) {
 		switch_log_printf(
 			SWITCH_CHANNEL_SESSION_LOG(vad->session),
 			SWITCH_LOG_DEBUG,
 			"AMD: MACHINE (voice_duration: %d, maximum_word_length: %d)\n",
 			vad->voice_duration,
-			globals.maximum_word_length);
+			vad->settings.maximum_word_length);
 
 		switch_channel_set_variable(vad->channel, "amd_result", "MACHINE");
 		switch_channel_set_variable(vad->channel, "amd_cause", "MAXWORDLENGTH");
 		return SWITCH_TRUE;
 	}
 
-	if (vad->words >= globals.maximum_number_of_words) {
+	if (vad->words >= vad->settings.maximum_number_of_words) {
 		switch_log_printf(
 			SWITCH_CHANNEL_SESSION_LOG(vad->session),
 			SWITCH_LOG_DEBUG,
 			"AMD: MACHINE (words: %d, maximum_number_of_words: %d)\n",
 			vad->words,
-			globals.maximum_number_of_words);
+			vad->settings.maximum_number_of_words);
 
 		switch_channel_set_variable(vad->channel, "amd_result", "MACHINE");
 		switch_channel_set_variable(vad->channel, "amd_cause", "MAXWORDS");
 		return SWITCH_TRUE;
 	}
 
-	if (vad->in_greeting && vad->voice_duration >= globals.greeting) {
+	if (vad->in_greeting && vad->voice_duration >= vad->settings.greeting) {
 		switch_log_printf(
 			SWITCH_CHANNEL_SESSION_LOG(vad->session),
 			SWITCH_LOG_DEBUG,
 			"AMD: MACHINE (voice_duration: %d, greeting: %d)\n",
 			vad->voice_duration,
-			globals.greeting);
+			vad->settings.greeting);
 
 		switch_channel_set_variable(vad->channel, "amd_result", "MACHINE");
 		switch_channel_set_variable(vad->channel, "amd_cause", "LONGGREETING");
 		return SWITCH_TRUE;
 	}
 
-	if (vad->voice_duration >= globals.minimum_word_length) {
+	if (vad->voice_duration >= vad->settings.minimum_word_length) {
 		if (vad->silence_duration) {
 			switch_log_printf(
 				SWITCH_CHANNEL_SESSION_LOG(vad->session),
@@ -293,7 +306,7 @@ static switch_bool_t amd_handle_voiced_frame(amd_vad_t *vad, const switch_frame_
 		vad->silence_duration = 0;
 	}
 
-	if (vad->voice_duration >= globals.minimum_word_length && !vad->in_greeting) {
+	if (vad->voice_duration >= vad->settings.minimum_word_length && !vad->in_greeting) {
 		if (vad->silence_duration) {
 			switch_log_printf(
 				SWITCH_CHANNEL_SESSION_LOG(vad->session),
@@ -310,6 +323,176 @@ static switch_bool_t amd_handle_voiced_frame(amd_vad_t *vad, const switch_frame_
 	return SWITCH_FALSE;
 }
 
+
+void amd_config_dump(amd_vad_t *s) {
+    struct amd_settings *settings;
+
+    if (s == NULL) {
+        return;
+    }
+    settings = &s->settings;
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_INFO, "Amd dynamic configuration: silence_threshold [%u], maximum_word_length [%u], maximum_number_of_words [%u],"
+            " between_words_silence [%u], min_word_length [%u], total_analysis_time [%u], after_greeting_silence [%u], greeting [%u],"
+           " initial_silence [%u]\n",
+            settings->silence_threshold, settings->maximum_word_length, settings->maximum_number_of_words, settings->between_words_silence, settings->minimum_word_length,
+            settings->total_analysis_time, settings->after_greeting_silence, settings->greeting, settings->initial_silence);
+    return;
+}
+
+
+
+static switch_status_t amd_parse_cmd_data_one_entry(char *candidate, struct amd_settings *settings) {
+    char        *candidate_parsed[3];
+    int         argc;
+    const char *key;
+    const char *val;
+
+    if (settings == NULL) {
+        return SWITCH_STATUS_TERM;
+    }
+    if (candidate == NULL) {
+        return SWITCH_STATUS_NOOP;
+    }
+
+    argc = switch_separate_string(candidate, '=', candidate_parsed, (sizeof(candidate_parsed) / sizeof(candidate_parsed[0])));
+    if (argc > 2) { /* currently we accept only option=value syntax */
+        return SWITCH_STATUS_IGNORE;
+    }
+
+    /* this may be option parameter if valid */
+    key = candidate_parsed[0];      /* option name */
+    if (zstr(key)) { /* empty key */
+        return SWITCH_STATUS_NOT_INITALIZED;
+    }
+    val = candidate_parsed[1];      /* value of the option: whole string starting at 1 past the '=' */
+    //if (zstr(val)) {  nothing after found, empty value 
+    //    return SWITCH_STATUS_MORE_DATA;
+    //}
+    /* candidate string has "=" somewhere in the middle and some value,
+     * try to find what option it is by comparing at most given number of bytes */
+    if (!strcmp(key, "initial_silence")) {
+        settings->initial_silence = (zstr(val)) ? settings->initial_silence : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "greeting")) {
+        settings->greeting = (zstr(val)) ? settings->greeting : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "after_greeting_silence")) {
+        settings->after_greeting_silence = (zstr(val)) ? settings->after_greeting_silence : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "total_analysis_time")) {
+        settings->total_analysis_time = (zstr(val)) ? settings->total_analysis_time : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "minimum_word_length")) {
+        settings->minimum_word_length = (zstr(val)) ? settings->minimum_word_length : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "between_words_silence")) {
+        settings->between_words_silence = (zstr(val)) ? settings->between_words_silence : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "maximum_number_of_words")) {
+        settings->maximum_number_of_words = (zstr(val)) ? settings->maximum_number_of_words : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "silence_threshold")) {
+        settings->silence_threshold = (zstr(val)) ? settings->silence_threshold : (uint32_t) strtoul(val, NULL, 10);
+    } else if (!strcmp(key, "maximum_word_length")) {
+        settings->maximum_word_length = (zstr(val)) ? settings->maximum_word_length : (uint32_t) strtoul(val, NULL, 10);
+    } else {
+        return SWITCH_STATUS_NOTFOUND;
+    }
+    return SWITCH_STATUS_SUCCESS;
+}
+
+
+
+
+/* RCU style: reads, copies and then updates only if everything is fine,
+ * if it returns SWITCH_STATUS_SUCCESS parsing went OK and amd settings
+ * are updated accordingly to @cmd_data, if SWITCH_STATUS_FALSE then
+ * parsing error occurred and amd session is left untouched */
+static switch_status_t amd_parse_cmd_data(amd_vad_t *s, const char *cmd_data, amd_app app) {
+    char *mydata;
+    struct amd_settings    settings;
+    int argc = 0, idx;
+    char *argv[AMD_PARAMS_APP_MAX * 2] = { 0 };
+    switch_status_t status = SWITCH_STATUS_SUCCESS;
+
+    if (s == NULL) {
+        return SWITCH_STATUS_NOOP;
+    }
+
+    memcpy(&settings, &globals.settings, sizeof (struct amd_settings));   /* copy globally set settings first */
+    if (zstr(cmd_data)) {
+        goto end_copy;
+    }
+    switch (app) {
+
+        case AMD_APP_START_APP:
+            /* try to parse settings */
+            mydata = switch_core_session_strdup(s->session, cmd_data);
+            argc = switch_separate_string(mydata, ',', argv, (sizeof(argv) / sizeof(argv[0])));
+            if (argc < AMD_PARAMS_APP_START_MIN || argc > AMD_PARAMS_APP_START_MAX) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                        "Syntax Error, amd_start APP takes [%u] to [%u] parameters\n",
+                        AMD_PARAMS_APP_START_MIN, AMD_PARAMS_APP_START_MAX);
+                switch_goto_status(SWITCH_STATUS_MORE_DATA, fail);
+            }
+            /* iterate over params, check if they mean something to us, set */
+            idx = 0;
+            while (idx < argc) {
+                switch_assert(argv[idx]);
+                status = amd_parse_cmd_data_one_entry(argv[idx], &settings);
+                if (status != SWITCH_STATUS_SUCCESS) {
+                    if (argv[idx]) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                            "Error parsing option [%d] [%s]\n", idx + 1, argv[idx]);    /* idx + 1 to report option 0 as 1 for users convenience */
+                    }
+                    switch (status)
+                    {   
+                        case SWITCH_STATUS_TERM:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "NULL settings struct passed to parser\n");
+                            break;
+                        case SWITCH_STATUS_NOOP:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "NULL settings string passed to parser\n");
+                            break;
+                        case SWITCH_STATUS_IGNORE:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "Syntax error. Currently we accept only option=value syntax\n");
+                            break;
+                        case SWITCH_STATUS_NOT_INITALIZED:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "Syntax error. No key specified\n");
+                            break;
+                        case SWITCH_STATUS_MORE_DATA:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "Syntax error. No value for the key? Currently we accept only option=value syntax\n");
+                            break;
+                        case SWITCH_STATUS_FALSE:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "Bad value for this option\n");
+                            break;
+                        case SWITCH_STATUS_NOTFOUND:
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR,
+                                    "Option not found. Please check option name is correct\n");
+                            break;
+                        default:
+                            break;
+                    }
+                    status = SWITCH_STATUS_FALSE;
+                    goto fail;
+                }
+                ++idx;
+            }
+            /* OK */
+            goto end_copy;
+        default:
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(s->session), SWITCH_LOG_ERROR, "There is no app with index [%u] for amd\n", app);
+            switch_goto_status(SWITCH_STATUS_NOTFOUND, fail);
+    }
+
+end_copy:
+    memcpy(&s->settings, &settings, sizeof (struct amd_settings)); /* commit the change */
+    return SWITCH_STATUS_SUCCESS;
+fail:
+    return status;
+}
+
+
+
+
 SWITCH_STANDARD_APP(amd_start_function)
 {
 	switch_channel_t *channel = switch_core_session_get_channel(session);
@@ -317,8 +500,8 @@ SWITCH_STANDARD_APP(amd_start_function)
 	switch_codec_implementation_t read_impl = { 0 };
 	switch_frame_t *read_frame;
 	switch_status_t status;
-	uint32_t timeout_ms = globals.total_analysis_time;
-	int32_t sample_count_limit;
+	uint32_t timeout_ms = globals.settings.total_analysis_time;
+	int32_t sample_count_limit = 0;
 	switch_bool_t complete = SWITCH_FALSE;
 
 	amd_vad_t vad = { 0 };
@@ -336,6 +519,22 @@ SWITCH_STANDARD_APP(amd_start_function)
 	vad.in_initial_silence = 1;
 	vad.in_greeting = 0;
 	vad.words = 0;
+
+        status = amd_parse_cmd_data(&vad,data,AMD_APP_START_APP);
+	switch (status) {
+           case SWITCH_STATUS_SUCCESS:
+            	break;
+           case SWITCH_STATUS_NOOP:
+            	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Failed to set dynamic parameters for amd session. Session is NULL!\n");
+            	goto end;
+           case SWITCH_STATUS_FALSE:
+           	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Failed to set dynamic parameters for amd session. Parsing error, please check the parameters passed to this APP.\n");
+            	goto end;
+           default:
+           	switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Failed to set dynamic parameteres for amd session. Unknown error\n");
+           	goto end;
+	}
+	amd_config_dump(&vad);
 
 	switch_core_session_get_read_impl(session, &read_impl);
 
@@ -425,4 +624,9 @@ SWITCH_STANDARD_APP(amd_start_function)
 
 	switch_core_session_reset(session, SWITCH_FALSE, SWITCH_TRUE);
 	switch_core_codec_destroy(&raw_codec);
+end:
+    if (status != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Amd on channel [%s] NOT started\n", switch_channel_get_name(channel));
+    }
+    return;
 }
